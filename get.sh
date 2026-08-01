@@ -294,6 +294,19 @@ if [ -e "$BOOT_IMG" ]; then
     TMP_BOOT="$TMP_DIR/boot_header.img"
     run_cmd dd if="$BOOT_IMG" of="$TMP_BOOT" bs=4096 count=1
 
+    # Manual parse sebelum magiskboot agar HDR_VER tersedia untuk fallback
+    MAGIC=$(dd if="$TMP_BOOT" bs=1 count=8 2>/dev/null | od -An -tx1 | tr -d ' \n' || echo "")
+    HDR_VER="unknown"
+    if [ "$MAGIC" = "414e44524f494421" ]; then
+        HDR_VER=$(dd if="$TMP_BOOT" bs=1 skip=24 count=4 2>/dev/null | od -An -tu4 | tr -d ' \n' || echo "unknown")
+        log_info "Boot header v0-v3 detected, version: $HDR_VER"
+    elif dd if="$TMP_BOOT" bs=1 count=4 skip=0 2>/dev/null | grep -q "ELF"; then
+        HDR_VER="4+ (ELF)"
+        log_info "ELF format detected (header v4+)"
+    else
+        log_warn "Unknown boot image format"
+    fi
+
     if [ -x "$BIN_DIR/magiskboot" ]; then
         log_step "Running magiskboot unpack -h"
         MB_OUT_FILE="$TMP_DIR/mb_header_out.txt"
@@ -315,18 +328,6 @@ if [ -e "$BOOT_IMG" ]; then
             log_info "Fallback to manual header parsing (magiskboot may report corrupt)"
         fi
         rm -f "$MB_OUT_FILE"
-    fi
-
-    # Manual parse
-    MAGIC=$(dd if="$TMP_BOOT" bs=1 count=8 2>/dev/null | od -An -tx1 | tr -d ' \n')
-    if [ "$MAGIC" = "414e44524f494421" ]; then
-        HDR_VER=$(dd if="$TMP_BOOT" bs=1 skip=24 count=4 2>/dev/null | od -An -tu4 | tr -d ' \n')
-        log_info "Boot header v0-v3 detected, version: $HDR_VER"
-    elif dd if="$TMP_BOOT" bs=1 count=4 skip=0 2>/dev/null | grep -q "ELF"; then
-        HDR_VER="4+ (ELF)"
-        log_info "ELF format detected (header v4+)"
-    else
-        log_warn "Unknown boot image format"
     fi
 
     rm -f "$TMP_BOOT"
