@@ -309,11 +309,23 @@ add_part_entry() {
     local name="$1" path="$2"
     local target size size_mb
     target=$(readlink -f "$path" 2>/dev/null || echo "$path")
+    # Skip duplicates by realpath (e.g. /dev/block/by-name/boot and
+    # /dev/block/platform/.../by-name/boot both resolve to /dev/block/mmcblk0p60).
+    # The first-seen name wins; later symlinks are suppressed.
+    if grep -qxF "$target" "$PART_SEEN_FILE" 2>/dev/null; then
+        log_info "  $name -> $target (dup, skipped)"
+        return 0
+    fi
+    echo "$target" >> "$PART_SEEN_FILE"
     size=$(blockdev --getsize64 "$target" 2>/dev/null || echo "0")
     size_mb=$((size / 1024 / 1024))
     log_info "  $name -> $target (${size_mb} MB)"
     PARTITIONS_JSON="${PARTITIONS_JSON}{\"name\":\"${name}\",\"path\":\"${target}\",\"size_mb\":${size_mb}},"
 }
+
+PART_SEEN_FILE="$TMP_DIR/partitions_seen.txt"
+rm -f "$PART_SEEN_FILE"
+PARTITIONS_JSON=""
 
 for part in boot dtbo vendor_boot init_boot vendor_kernel_boot recovery dtb vbmeta vbmeta_system vbmeta_vendor super; do
     for suffix in "" "_a" "_b"; do
@@ -336,6 +348,7 @@ for base in /dev/block/platform/*/by-name /dev/block/platform/*/*/by-name; do
     done
 done
 
+rm -f "$PART_SEEN_FILE"
 PARTITIONS_JSON="[${PARTITIONS_JSON%,}]"
 json_add "partitions" "$PARTITIONS_JSON"
 
@@ -382,10 +395,29 @@ if resolve_part boot >/dev/null 2>&1; then
             echo "$MB_OUT" | head -30 | while IFS= read -r line; do
                 log_raw "$line"
             done
-            # Build JSON only from KEY=VALUE lines magiskboot prints
-            BOOT_HEADER_JSON=$(echo "$MB_OUT" | grep -E '^[A-Z_]+\s*\[' | sed 's/\([^[]*\)\[\([0-9]*\)\]/"\1":"\2"/' | paste -sd, 2>/dev/null | sed 's/^/{/;s/$/}/' || echo "")
+            # Build JSON from each "KEY     [value]" line magiskboot prints.
+            # Partition each line on the FIRST '[' so values may safely contain
+            # anything except ']' (magiskboot's format doesn't nest). Trim key
+            # and value, JSON-escape value, quote both. Drop the trailing ']'.
+            HDR_PAIRS_FILE="$TMP_DIR/hdr_pairs.txt"
+            rm -f "$HDR_PAIRS_FILE"
+            echo "$MB_OUT" | while IFS= read -r line; do
+                case "$line" in
+                    *'['*']'*)
+                        key=${line%%\[*}; key=$(echo "$key" | sed 's/^[ 	]*//;s/[ 	]*$//')
+                        val=${line#*[}; val=${val%]*}
+                        vesc=$(json_escape "$val")
+                        [ -n "$key" ] && printf '"%s":"%s",\n' "$key" "$vesc" >> "$HDR_PAIRS_FILE"
+                        ;;
+                esac
+            done
+            if [ -s "$HDR_PAIRS_FILE" 2>/dev/null ]; then
+                HDR_PAIRS=$(cat "$HDR_PAIRS_FILE")
+                HDR_PAIRS_R="${HDR_PAIRS%,}"
+                BOOT_HEADER_JSON="{$HDR_PAIRS_R}"
+            fi
+            rm -f "$HDR_PAIRS_FILE" "$MB_OUT_FILE"
             [ -z "$BOOT_HEADER_JSON" ] && BOOT_HEADER_JSON="{\"magic\":\"ANDROID!\",\"header_version\":\"$HDR_VER\",\"kernel_sz\":\"$KERNEL_SZ\",\"ramdisk_sz\":\"$RAMDISK_SZ\"}"
-            rm -f "$MB_OUT_FILE"
         else
             BOOT_HEADER_JSON="{\"magic\":\"ANDROID!\",\"header_version\":\"$HDR_VER\",\"kernel_sz\":\"$KERNEL_SZ\",\"ramdisk_sz\":\"$RAMDISK_SZ\"}"
         fi
@@ -454,6 +486,46 @@ probe_part_ramdisk() {
             done
         fi
     fi
+
+    # MANUAL FALLBACK: when magiskboot reports "Corrupted" it aborts mid-unpack
+    # and never emits ramdisk.cpio — yet the header still has RAMDISK_SZ > 0.
+    # For boot header v0/v1/v2 we know the layout:
+    #   page0    = boot_img_hdr (4096-byte page)
+    #   page1..N = kernel (KERNEL_SZ bytes, padded to page boundary)
+    #   pageN+1  = ramdisk (RAMDISK_SZ bytes)
+    # Compute ramdisk byte-offset and dd it out, then sniff compression by magic.
+    if [ -z "$PROBE_COMP" ] && [ "$PROBE_HVER" -ge 0 ] 2>/dev/null && [ "$PROBE_HVER" -le 2 ] 2>/dev/null; then
+        local ksz rsz psize pages kernel_pages ramdisk_off
+        ksz=$(dd if="$hdrfile" bs=1 skip=8  count=4 2>/dev/null | od -An -tu4 | tr -d ' \n' || echo 0)
+        rsz=$(dd if="$hdrfile" bs=1 skip=12 count=4 2>/dev/null | od -An -tu4 | tr -d ' \n' || echo 0)
+        psize=$(dd if="$hdrfile" bs=1 skip=36 count=4 2>/dev/null | od -An -tu4 | tr -d ' \n' || echo 4096)
+        [ -z "$psize" ] || [ "$psize" -eq 0 ] 2>/dev/null && psize=4096
+        if [ -z "$ksz" ] || [ "$ksz" -le 0 ] 2>/dev/null || [ -z "$rsz" ] || [ "$rsz" -le 0 ] 2>/dev/null; then
+            rm -rf "$workdir"
+            [ -n "$PROBE_COMP" ] || return 1
+            return 0
+        fi
+        # kernel_pages = ceil(ksz/psize)
+        pages=$(( ksz / psize )); [ $(( ksz % psize )) -gt 0 ] && pages=$(( pages + 1 ))
+        # header occupies 1 page in v0/v1 (v2 same for legacy region we care about)
+        ramdisk_off=$(( psize + pages * psize ))
+        local raw="$workdir/ramdisk.raw"
+        if safe_dd if="$p" of="$raw" bs=1 skip="$ramdisk_off" count="$rsz" 2>/dev/null && [ -s "$raw" ]; then
+            # Sniff compression magic
+            local m; m=$(dd if="$raw" bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')
+            case "$m" in
+                1f8b08*)     comp="gzip";;
+                02214c18*|04224d18*) comp="lz4";;
+                894c5a4f)    comp="lzop";;
+                425a68*)     comp="bzip2";;
+                fd*377a585a00) comp="xz";;
+                28b52ffd)    comp="zstd";;
+                *)           comp="none";;
+            esac
+            PROBE_COMP="$comp"; PROBE_SIZE=$(wc -c < "$raw" 2>/dev/null)
+            log_info "  $part: magiskboot failed/corrupt; manual offset $ramdisk_off extracted ramdisk ($PROBE_COMP, ${PROBE_SIZE}B)"
+        fi
+    fi
     rm -rf "$workdir"
     [ -n "$PROBE_COMP" ] || return 1
     return 0
@@ -468,6 +540,19 @@ AK3_RAMDISK_COMPRESSION_OUT="auto"
 
 # Probe in priority order, stop at first that yields a real ramdisk
 PROBE_FOUND=0
+# HIGHEST-PRIORITY SIGNAL: skip_initramfs in /proc/cmdline means first-stage
+# init ramdisk does NOT live in boot.img (even if boot.img carries a small
+# recovery-mode stub ramdisk). Choosing split_boot/flash_boot here avoids the
+# common flashable failure where AK3 repacks the wrong ramdisk. Probe sections
+# still run for cross-device generality, but SAR overrides the install mode.
+EARLY_CMDLINE=$(cat /proc/cmdline 2>/dev/null)
+if echo "$EARLY_CMDLINE" | grep -q 'skip_initramfs'; then
+    IS_SAR=1
+    log_info "Detected skip_initramfs in cmdline -> SAR device (first-stage init NOT in boot.img)"
+else
+    IS_SAR=0
+fi
+
 for cand in init_boot:ramdisk_init boot:ramdisk_boot vendor_boot:ramdisk_vboot; do
     part="${cand%%:*}"; label="${cand##*:}"
     log_step "Probing $part for ramdisk..."
@@ -481,32 +566,35 @@ for cand in init_boot:ramdisk_init boot:ramdisk_boot vendor_boot:ramdisk_vboot; 
             boot)        RAMDISK_LOCATION="boot";        AK3_RECOMMENDED_BLOCK="boot"        ;;
         esac
         AK3_RAMDISK_COMPRESSION_OUT="auto"
-        # hdr v4+ supports only lz4-l ramdisk (per ak3-core.sh:197); keep auto.
         AK3_INSTALL_MODE="dump_boot,write_boot"
         PROBE_FOUND=1
         break
     fi
 done
 
-# Decision logic for AK3 install mode when no ramdisk found in any candidate
-if [ "$PROBE_FOUND" -eq 0 ]; then
-    EARLY_CMDLINE=$(cat /proc/cmdline 2>/dev/null)
-    if echo "$EARLY_CMDLINE" | grep -q 'skip_initramfs'; then
-        RAMDISK_LOCATION="boot_sar(empty)"
-        AK3_RECOMMENDED_BLOCK="boot"
-        AK3_INSTALL_MODE="split_boot,flash_boot"   # NO ramdisk unpack/repack
-        AK3_RAMDISK_COMPRESSION_OUT="none"
-        log_info "Boot has NO ramdisk (skip_initramfs/OG-SAR). Use split_boot + flash_boot."
-    elif resolve_part recovery >/dev/null 2>&1; then
-        RAMDISK_LOCATION="recovery_only"
-        AK3_RECOMMENDED_BLOCK="boot"
-        AK3_INSTALL_MODE="split_boot,flash_boot"
-        log_warn "No init ramdisk in boot/init_boot/vendor_boot. Recovery holds it; kernel-flash only via split_boot/flash_boot."
-    else
-        RAMDISK_LOCATION="none"
-        AK3_RECOMMENDED_BLOCK="boot"
-        AK3_INSTALL_MODE="split_boot,flash_boot"
-        log_warn "No ramdisk located in any candidate partition; defaulting to boot + split_boot/flash_boot (safe / OG-AK mode)."
+# SAR override: even if a small stub ramdisk was found in boot.img, SAR devices
+# must NOT repack that stub; the real first-stage init is in /system. Force
+# split_boot/flash_boot (no ramdisk unpack) for kernel-only flashes.
+if [ "$IS_SAR" -eq 1 ]; then
+    RAMDISK_LOCATION="boot_sar(empty)"
+    AK3_RECOMMENDED_BLOCK="boot"
+    AK3_INSTALL_MODE="split_boot,flash_boot"
+    AK3_RAMDISK_COMPRESSION_OUT="none"
+    log_info "SAR override: split_boot + flash_boot (no ramdisk repack)"
+else
+    # Non-SAR fallback path (only reached when no probe succeeded and not SAR)
+    if [ "$PROBE_FOUND" -eq 0 ]; then
+        if resolve_part recovery >/dev/null 2>&1; then
+            RAMDISK_LOCATION="recovery_only"
+            AK3_RECOMMENDED_BLOCK="boot"
+            AK3_INSTALL_MODE="split_boot,flash_boot"
+            log_warn "No init ramdisk in boot/init_boot/vendor_boot. Recovery holds it; kernel-flash only via split_boot/flash_boot."
+        else
+            RAMDISK_LOCATION="none"
+            AK3_RECOMMENDED_BLOCK="boot"
+            AK3_INSTALL_MODE="split_boot,flash_boot"
+            log_warn "No ramdisk located in any candidate partition; defaulting to boot + split_boot/flash_boot (safe / OG-AK mode)."
+        fi
     fi
 fi
 
