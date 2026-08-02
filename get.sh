@@ -4,7 +4,10 @@
 # Output: <script_dir>/<device_codename>.json + .log
 
 # POSIX compliant - works with mksh, bash, dash, busybox sh
-set -e
+# NOTE: no `set -e` — on strict read-only root many dd/blockdev/getprop calls
+# fail intermittently; we must not abort the whole collector on a single error.
+# Guard critical operations individually with `|| true` / `2>/dev/null` instead.
+set +e
 
 # ============================================
 # DETECT SCRIPT LOCATION & SETUP BIN PATH
@@ -80,15 +83,60 @@ json_finalize() { sed -i '$ s/,$//' "$JSON_FILE"; echo "}" >> "$JSON_FILE"; }
 # Escape for JSON
 json_escape() { echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\n/\\n/g; s/\r/\\r/g; s/\t/\\t/g'; }
 
-# Run command with logging - output goes to stdout and log file
+# Run command with logging - output goes to stdout and log file.
+# Never abort the script: pipe to tee in a subshell so failures are captured
+# but do not propagate (no set -e in play anyway).
 run_cmd() {
     log_cmd "$*"
-    "$@" 2>&1 | tee -a "$LOG_FILE"
+    "$@" 2>&1 | tee -a "$LOG_FILE" || true
 }
 
-# Getprop with fallback
+# Robust getprop: try system getprop, then scan common build.prop locations.
+# On strict read-only root /system may be unreadable from the collector's
+# selinux context, so every read is best-effort.
 get_prop() {
-    getprop "$1" 2>/dev/null || echo "N/A"
+    local val
+    val=$(getprop "$1" 2>/dev/null)
+    [ -n "$val" ] && { echo "$val"; return; }
+    for d in / /system_root /system /vendor /product /system_ext /odm; do
+        for f in default.prop build.prop; do
+            val=$(file_getprop "$d/$f" "$1" 2>/dev/null)
+            [ -n "$val" ] && { echo "$val"; return; }
+        done
+    done
+    echo "N/A"
+}
+
+# file_getprop local copy (independent of busybox env quirks)
+file_getprop() { grep "^$2=" "$1" 2>/dev/null | tail -n1 | cut -d= -f2-; }
+
+# Safely run a block device read: returns non-zero if device missing or
+# unreadable. Used to detect strict read-only partitions.
+safe_dd() {
+    # $1=if $2=of $3..=rest
+    dd "$@" 2>/dev/null || return 1
+}
+
+# Detect partition real path across all common by-name layouts (read-only safe)
+resolve_part() {
+    local name="$1" p target
+    for base in /dev/block/by-name /dev/block/bootdevice/by-name /dev/block/mapper; do
+        for p in "$base/$name" "$base/$name$SLOT_SUFFIX" "$base/${name}_a" "$base/${name}_b"; do
+            if [ -e "$p" ] || [ -L "$p" ]; then
+                target=$(readlink -f "$p" 2>/dev/null || echo "$p")
+                [ -e "$target" ] && { echo "$target"; return 0; }
+            fi
+        done
+    done
+    return 1
+}
+
+# Read-only check on a block device; returns 0 if path exists & is readable
+part_readable() {
+    local p="$1"
+    [ -e "$p" ] || return 1
+    dd if="$p" of=/dev/null bs=512 count=1 2>/dev/null || return 1
+    return 0
 }
 
 # ============================================
@@ -240,9 +288,11 @@ elif [ -n "$SLOT" ] && [ "$SLOT" != "N/A" ]; then
     ACTIVE_SLOT="_$SLOT"
     log_info "Device is A/B (slot: _$SLOT)"
 else
-    if ls /dev/block/by-name/boot_a 2>/dev/null | grep -q .; then
+    # Cross-check via partition existence (read-only safe)
+    if [ -e /dev/block/by-name/boot_a ] || resolve_part boot_a >/dev/null 2>&1; then
         IS_AB=1
-        log_info "Device is A/B (detected via partition)"
+        ACTIVE_SLOT="_a"
+        log_info "Device is A/B (detected via boot_a partition)"
     else
         log_info "Device is Non-A/B"
     fi
@@ -252,28 +302,38 @@ json_add_str "is_ab_device" "$IS_AB"
 json_add_str "active_slot" "$ACTIVE_SLOT"
 json_add_str "slot_suffix" "$SLOT_SUFFIX"
 
-# Partition scan
+# Partition scan (run in parent shell so JSON var is preserved)
 log_step "Scanning partitions..."
 PARTITIONS_JSON=""
+add_part_entry() {
+    local name="$1" path="$2"
+    local target size size_mb
+    target=$(readlink -f "$path" 2>/dev/null || echo "$path")
+    size=$(blockdev --getsize64 "$target" 2>/dev/null || echo "0")
+    size_mb=$((size / 1024 / 1024))
+    log_info "  $name -> $target (${size_mb} MB)"
+    PARTITIONS_JSON="${PARTITIONS_JSON}{\"name\":\"${name}\",\"path\":\"${target}\",\"size_mb\":${size_mb}},"
+}
+
 for part in boot dtbo vendor_boot init_boot vendor_kernel_boot recovery dtb vbmeta vbmeta_system vbmeta_vendor super; do
     for suffix in "" "_a" "_b"; do
         path="/dev/block/by-name/${part}${suffix}"
         if [ -e "$path" ] || [ -L "$path" ]; then
-            target=$(readlink -f "$path" 2>/dev/null || echo "$path")
-            size=$(blockdev --getsize64 "$target" 2>/dev/null || echo "0")
-            size_mb=$((size / 1024 / 1024))
-            log_info "  ${part}${suffix} -> $target (${size_mb} MB)"
-            PARTITIONS_JSON="${PARTITIONS_JSON}{\"name\":\"${part}${suffix}\",\"path\":\"${target}\",\"size_mb\":${size_mb}},"
+            add_part_entry "${part}${suffix}" "$path"
         fi
     done
 done
 
-# Platform paths
-find /dev/block/platform -name "boot*" -o -name "dtbo*" -o -name "vendor_boot*" -o -name "init_boot*" -o -name "recovery*" 2>/dev/null | while read p; do
-    size=$(blockdev --getsize64 "$p" 2>/dev/null || echo "0")
-    size_mb=$((size / 1024 / 1024))
-    log_info "  $p (${size_mb} MB)"
-    PARTITIONS_JSON="${PARTITIONS_JSON}{\"name\":\"$(basename "$p")\",\"path\":\"${p}\",\"size_mb\":${size_mb}},"
+# Platform by-name layout (symlinks resolving to real block devs)
+for base in /dev/block/platform/*/by-name /dev/block/platform/*/*/by-name; do
+    [ -d "$base" ] || continue
+    for part in boot dtbo vendor_boot init_boot recovery vbmeta; do
+        for p in "$base/$part" "$base/${part}_a" "$base/${part}_b"; do
+            if { [ -e "$p" ] || [ -L "$p" ]; } && part_readable "$p"; then
+                add_part_entry "$(basename "$p")" "$p"
+            fi
+        done
+    done
 done
 
 PARTITIONS_JSON="[${PARTITIONS_JSON%,}]"
@@ -289,169 +349,233 @@ BOOT_IMG="/dev/block/by-name/boot"
 
 BOOT_HEADER_JSON="{}"
 HDR_VER="unknown"
-if [ -e "$BOOT_IMG" ]; then
+RAMDISK_SZ=0
+KERNEL_SZ=0
+if resolve_part boot >/dev/null 2>&1; then
+    BOOT_IMG=$(resolve_part boot)
     log_info "Analyzing boot image: $BOOT_IMG"
     TMP_BOOT="$TMP_DIR/boot_header.img"
-    run_cmd dd if="$BOOT_IMG" of="$TMP_BOOT" bs=4096 count=1
+    safe_dd if="$BOOT_IMG" of="$TMP_BOOT" bs=4096 count=1 || log_warn "Cannot read boot partition header (read-only?)"
 
-    # Manual parse sebelum magiskboot agar HDR_VER tersedia untuk fallback
-    MAGIC=$(dd if="$TMP_BOOT" bs=1 count=8 2>/dev/null | od -An -tx1 | tr -d ' \n' || echo "")
-    HDR_VER="unknown"
-    if [ "$MAGIC" = "414e44524f494421" ]; then
-        HDR_VER=$(dd if="$TMP_BOOT" bs=1 skip=24 count=4 2>/dev/null | od -An -tu4 | tr -d ' \n' || echo "unknown")
-        log_info "Boot header v0-v3 detected, version: $HDR_VER"
-    elif dd if="$TMP_BOOT" bs=1 count=4 skip=0 2>/dev/null | grep -q "ELF"; then
-        HDR_VER="4+ (ELF)"
-        log_info "ELF format detected (header v4+)"
-    else
-        log_warn "Unknown boot image format"
-    fi
-
-    if [ -x "$BIN_DIR/magiskboot" ]; then
-        log_step "Running magiskboot unpack -h"
-        MB_OUT_FILE="$TMP_DIR/mb_header_out.txt"
-        (
-            "$BIN_DIR/magiskboot" unpack -h "$TMP_BOOT" 2>&1
-        ) | tee "$MB_OUT_FILE"
-        MB_OUT=$(cat "$MB_OUT_FILE" 2>/dev/null)
-        echo "$MB_OUT" | head -30 | while IFS= read -r line; do
-            log_raw "$line"
-        done
-        BOOT_HEADER_JSON=$(echo "$MB_OUT" | grep -E '^[A-Z_]+=' | sed 's/\([^=]*\)=\(.*\)/"\1":"\2"/' | paste -sd, | sed 's/^/{/;s/$/}/')
-        # Fallback: jika magiskboot lapor corrupt tapi manual valid, isi manual
-        if [ -z "$BOOT_HEADER_JSON" ] || echo "$MB_OUT" | grep -q "Corrupted"; then
-            MANUAL_HDR="{"
-            MANUAL_HDR="$MANUAL_HDR\"magic\":\"ANDROID!\","
-            MANUAL_HDR="$MANUAL_HDR\"header_version\":\"$HDR_VER\""
-            MANUAL_HDR="$MANUAL_HDR}"
-            BOOT_HEADER_JSON="$MANUAL_HDR"
-            log_info "Fallback to manual header parsing (magiskboot may report corrupt)"
+    if [ -f "$TMP_BOOT" ]; then
+        # Manual parse — independent of magiskboot, robust against "Corrupted" reports
+        MAGIC=$(dd if="$TMP_BOOT" bs=1 count=8 2>/dev/null | od -An -tx1 | tr -d ' \n' || echo "")
+        if [ "$MAGIC" = "414e44524f494421" ]; then
+            # ANDROID! magic (v0-v3); header version is 4 bytes at offset 24 (le)
+            HDR_VER=$(dd if="$TMP_BOOT" bs=1 skip=24 count=4 2>/dev/null | od -An -tu4 | tr -d ' \n' || echo "0")
+            [ -z "$HDR_VER" ] && HDR_VER=0
+            KERNEL_SZ=$(dd if="$TMP_BOOT" bs=1 skip=8  count=4 2>/dev/null | od -An -tu4 | tr -d ' \n' || echo "0")
+            RAMDISK_SZ=$(dd if="$TMP_BOOT" bs=1 skip=12 count=4 2>/dev/null | od -An -tu4 | tr -d ' \n' || echo "0")
+            log_info "Boot header v$HDR_VER (magic ANDROID!, kernel=${KERNEL_SZ}B, ramdisk=${RAMDISK_SZ}B)"
+        elif dd if="$TMP_BOOT" bs=1 count=4 skip=0 2>/dev/null | od -An -c 2>/dev/null | grep -q E; then
+            HDR_VER="4+ (ELF)"
+            log_info "ELF format detected (header v4+ / GKI)"
+        else
+            log_warn "Unknown boot image format (magic: ${MAGIC:-empty})"
         fi
-        rm -f "$MB_OUT_FILE"
-    fi
 
+        if [ -x "$BIN_DIR/magiskboot" ]; then
+            log_step "Running magiskboot unpack -h"
+            MB_OUT_FILE="$TMP_DIR/mb_header_out.txt"
+            "$BIN_DIR/magiskboot" unpack -h "$TMP_BOOT" > "$MB_OUT_FILE" 2>&1 || true
+            MB_OUT=$(cat "$MB_OUT_FILE" 2>/dev/null)
+            echo "$MB_OUT" | head -30 | while IFS= read -r line; do
+                log_raw "$line"
+            done
+            # Build JSON only from KEY=VALUE lines magiskboot prints
+            BOOT_HEADER_JSON=$(echo "$MB_OUT" | grep -E '^[A-Z_]+\s*\[' | sed 's/\([^[]*\)\[\([0-9]*\)\]/"\1":"\2"/' | paste -sd, 2>/dev/null | sed 's/^/{/;s/$/}/' || echo "")
+            [ -z "$BOOT_HEADER_JSON" ] && BOOT_HEADER_JSON="{\"magic\":\"ANDROID!\",\"header_version\":\"$HDR_VER\",\"kernel_sz\":\"$KERNEL_SZ\",\"ramdisk_sz\":\"$RAMDISK_SZ\"}"
+            rm -f "$MB_OUT_FILE"
+        else
+            BOOT_HEADER_JSON="{\"magic\":\"ANDROID!\",\"header_version\":\"$HDR_VER\",\"kernel_sz\":\"$KERNEL_SZ\",\"ramdisk_sz\":\"$RAMDISK_SZ\"}"
+        fi
+    fi
     rm -f "$TMP_BOOT"
 else
-    log_error "Boot partition not found at $BOOT_IMG"
+    log_error "Boot partition not resolved by any by-name path"
+    BOOT_IMG="N/A"
 fi
 
 json_add "boot_header" "$BOOT_HEADER_JSON"
 json_add_str "boot_header_version" "$HDR_VER"
 json_add_str "boot_partition" "$BOOT_IMG"
+json_add_str "boot_ramdisk_sz_header" "$RAMDISK_SZ"
 
 # ============================================
-# 6. RAMDISK COMPRESSION
+# 6. RAMDISK LOCATION & COMPRESSION PROBE  (CRITICAL for AK3 target)
 # ============================================
-log_header "6. RAMDISK COMPRESSION DETECTION"
+# Goal: figure out WHERE the first-stage init ramdisk lives so AK3 flashes the
+# right partition in the right mode. Common failure modes when wrong:
+#   - boot.img RAMDISK_SZ=0 (skip_initramfs / OG-SAR) -> use split_boot/flash_boot (no ramdisk unpack)
+#   - ramdisk in init_boot (Android 13+) -> BLOCK=init_boot, dump_boot/write_boot
+#   - ramdisk in vendor_boot (GKI)        -> BLOCK=vendor_boot
+# Probe candidates in priority order: init_boot > boot > vendor_boot > recovery.
+log_header "6. RAMDISK LOCATION & COMPRESSION PROBE"
+
+# helper: probe one partition; sets globals PROBE_COMP PROBE_SIZE PROBE_HVER on success
+# args: <part_name> [workdir_label]
+probe_part_ramdisk() {
+    local part="$1" label="$2" p workdir hdrfile comp f sz magic hver
+    PROBE_COMP=""; PROBE_SIZE=0; PROBE_HVER="unknown"
+    p=$(resolve_part "$part" 2>/dev/null) || return 1
+    [ -n "$p" ] || return 1
+    part_readable "$p" || { log_warn "  $part unreadable (read-only?): $p"; return 1; }
+    workdir="$TMP_DIR/probe_${label}"
+    rm -rf "$workdir"; mkdir -p "$workdir"
+    hdrfile="$workdir/hdr.img"
+    safe_dd if="$p" of="$hdrfile" bs=4096 count=1 2>/dev/null || return 1
+    magic=$(dd if="$hdrfile" bs=1 count=8 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    case "$magic" in
+        414e44524f494421) PROBE_HVER=$(dd if="$hdrfile" bs=1 skip=24 count=4 2>/dev/null | od -An -tu4 | tr -d ' \n' || echo "0");;
+        *) PROBE_HVER="unknown($magic)";;
+    esac
+
+    if [ -x "$BIN_DIR/magiskboot" ]; then
+        ( cd "$workdir" && "$BIN_DIR/magiskboot" unpack "$hdrfile" >/dev/null 2>&1 ) || true
+        # Note: unpack -h doesn't dump ramdisk content; do a full dd + unpack for size
+        local fullimg="$workdir/full.img"
+        if safe_dd if="$p" of="$fullimg" 2>/dev/null; then
+            ( cd "$workdir" && rm -f ramdisk.cpio* kernel* dt* && "$BIN_DIR/magiskboot" unpack "$fullimg" >/dev/null 2>&1 ) || true
+            for f in "$workdir"/ramdisk.cpio*; do
+                [ -f "$f" ] || continue
+                sz=$(wc -c < "$f" 2>/dev/null)
+                [ -n "$sz" ] && [ "$sz" -gt 0 ] || continue
+                case "$f" in
+                    *.gz)   comp="gzip" ;;
+                    *.lz4)  comp="lz4" ;;
+                    *.lzo)  comp="lzop" ;;
+                    *.bz2)  comp="bzip2" ;;
+                    *.xz)   comp="xz" ;;
+                    *.zst)  comp="zstd" ;;
+                    *)      comp="none" ;;
+                esac
+                PROBE_COMP="$comp"; PROBE_SIZE="$sz"
+                break
+            done
+        fi
+    fi
+    rm -rf "$workdir"
+    [ -n "$PROBE_COMP" ] || return 1
+    return 0
+}
 
 RAMDISK_COMP="unknown"
 RAMDISK_SIZE=0
+RAMDISK_LOCATION="unknown"           # boot | init_boot | vendor_boot | boot_sar(empty) | recovery_only
+AK3_RECOMMENDED_BLOCK="auto"
+AK3_INSTALL_MODE="split_boot,flash_boot"   # safe default
+AK3_RAMDISK_COMPRESSION_OUT="auto"
 
-TMP_BOOT="$TMP_DIR/boot_ramdisk.img"
-run_cmd dd if="$BOOT_IMG" of="$TMP_BOOT"
-
-if [ -x "$BIN_DIR/magiskboot" ]; then
-    log_step "Unpacking boot image with magiskboot"
-    MB_OUT_FILE="$TMP_DIR/mb_unpack_out.txt"
-    (
-        cd "$TMP_DIR" || exit 1
-        "$BIN_DIR/magiskboot" unpack "$TMP_BOOT" 2>&1
-    ) | tee "$MB_OUT_FILE" || log_warn "magiskboot unpack failed (section 6)"
-    rm -f "$MB_OUT_FILE"
-    for f in "$TMP_DIR"/ramdisk.cpio*; do
-        [ -f "$f" ] && RAMDISK_SIZE=$(wc -c < "$f") && case "$f" in
-            *.gz)  RAMDISK_COMP="gzip" ;;
-            *.lz4) RAMDISK_COMP="lz4" ;;
-            *.lzo) RAMDISK_COMP="lzop" ;;
-            *.bz2) RAMDISK_COMP="bzip2" ;;
-            *.xz)  RAMDISK_COMP="xz" ;;
-            *.zst) RAMDISK_COMP="zstd" ;;
-            *)     RAMDISK_COMP="none" ;;
+# Probe in priority order, stop at first that yields a real ramdisk
+PROBE_FOUND=0
+for cand in init_boot:ramdisk_init boot:ramdisk_boot vendor_boot:ramdisk_vboot; do
+    part="${cand%%:*}"; label="${cand##*:}"
+    log_step "Probing $part for ramdisk..."
+    if probe_part_ramdisk "$part" "$label"; then
+        log_info "  $part: ramdisk found (comp=$PROBE_COMP, ${PROBE_SIZE}B, hdr=$PROBE_HVER)"
+        RAMDISK_COMP="$PROBE_COMP"
+        RAMDISK_SIZE="$PROBE_SIZE"
+        case "$part" in
+            init_boot)   RAMDISK_LOCATION="init_boot";   AK3_RECOMMENDED_BLOCK="init_boot"   ;;
+            vendor_boot) RAMDISK_LOCATION="vendor_boot"; AK3_RECOMMENDED_BLOCK="vendor_boot" ;;
+            boot)        RAMDISK_LOCATION="boot";        AK3_RECOMMENDED_BLOCK="boot"        ;;
         esac
-    done
-    rm -f "$TMP_DIR"/ramdisk.cpio* "$TMP_DIR"/kernel* "$TMP_DIR"/dt* "$TMP_DIR"/cmdline.txt "$TMP_DIR"/header 2>/dev/null
-else
-    # Fallback: detect from boot image header directly
-    case "$(dd if="$TMP_BOOT" bs=1 count=8 2>/dev/null | od -An -tx1 | tr -d ' \n')" in
-        1f8b08) RAMDISK_COMP="gzip" ;;
-        02214c18) RAMDISK_COMP="lz4" ;;
-        894c5a4f) RAMDISK_COMP="lzop" ;;
-        425a6839) RAMDISK_COMP="bzip2" ;;
-        fdfb6b6a) RAMDISK_COMP="xz" ;;
-        28b52ffd) RAMDISK_COMP="zstd" ;;
-    esac
-    RAMDISK_SIZE=$(wc -c < "$TMP_BOOT")
+        AK3_RAMDISK_COMPRESSION_OUT="auto"
+        # hdr v4+ supports only lz4-l ramdisk (per ak3-core.sh:197); keep auto.
+        AK3_INSTALL_MODE="dump_boot,write_boot"
+        PROBE_FOUND=1
+        break
+    fi
+done
+
+# Decision logic for AK3 install mode when no ramdisk found in any candidate
+if [ "$PROBE_FOUND" -eq 0 ]; then
+    EARLY_CMDLINE=$(cat /proc/cmdline 2>/dev/null)
+    if echo "$EARLY_CMDLINE" | grep -q 'skip_initramfs'; then
+        RAMDISK_LOCATION="boot_sar(empty)"
+        AK3_RECOMMENDED_BLOCK="boot"
+        AK3_INSTALL_MODE="split_boot,flash_boot"   # NO ramdisk unpack/repack
+        AK3_RAMDISK_COMPRESSION_OUT="none"
+        log_info "Boot has NO ramdisk (skip_initramfs/OG-SAR). Use split_boot + flash_boot."
+    elif resolve_part recovery >/dev/null 2>&1; then
+        RAMDISK_LOCATION="recovery_only"
+        AK3_RECOMMENDED_BLOCK="boot"
+        AK3_INSTALL_MODE="split_boot,flash_boot"
+        log_warn "No init ramdisk in boot/init_boot/vendor_boot. Recovery holds it; kernel-flash only via split_boot/flash_boot."
+    else
+        RAMDISK_LOCATION="none"
+        AK3_RECOMMENDED_BLOCK="boot"
+        AK3_INSTALL_MODE="split_boot,flash_boot"
+        log_warn "No ramdisk located in any candidate partition; defaulting to boot + split_boot/flash_boot (safe / OG-AK mode)."
+    fi
 fi
 
+# Clean up the leftover probe placeholder var (avoid confusion)
+unset EARLY_CMDLINE CMDLINE_PLUGIN_PROBE 2>/dev/null
+
+log_info "Ramdisk location: $RAMDISK_LOCATION"
 log_info "Ramdisk compression: $RAMDISK_COMP"
 log_info "Ramdisk size: $RAMDISK_SIZE bytes ($((RAMDISK_SIZE/1024)) KB)"
+log_info "AK3 recommended BLOCK: $AK3_RECOMMENDED_BLOCK"
+log_info "AK3 install mode: $AK3_INSTALL_MODE"
 
 json_add_str "ramdisk_compression" "$RAMDISK_COMP"
 json_add_str "ramdisk_size_bytes" "$RAMDISK_SIZE"
-
-# Fallback: jika boot ramdisk kosong (RAMDISK_SZ 0 atau size 0), cek vendor_boot / init_boot
-if [ "$RAMDISK_SIZE" -eq 0 ] || [ "$RAMDISK_COMP" = "unknown" ]; then
-    for vb in "/dev/block/by-name/vendor_boot" "/dev/block/by-name/init_boot"; do
-        [ -e "$vb" ] || continue
-        log_info "Checking ramdisk in $vb (boot ramdisk was empty)"
-        TMP_VB_CHECK="$TMP_DIR/check_vb.img"
-        run_cmd dd if="$vb" of="$TMP_VB_CHECK" bs=4096 count=1 2>/dev/null || true
-        MAGIC_VB=$(dd if="$TMP_VB_CHECK" bs=1 count=8 2>/dev/null | od -An -tx1 | tr -d ' \n' || echo "")
-        [ -n "$MAGIC_VB" ] && log_info "  $vb magic: $MAGIC_VB"
-        # Coba unpack dengan magiskboot jika ada
-        if [ -x "$BIN_DIR/magiskboot" ]; then
-            VB_UNPACK="$TMP_DIR/vb_unpack"
-            mkdir -p "$VB_UNPACK"
-            ("$BIN_DIR/magiskboot" unpack "$vb" 2>/dev/null) || true
-            # Deteksi file ramdisk dari unpack
-            for f in "$VB_UNPACK"/ramdisk.cpio*; do
-                [ -f "$f" ] || continue
-                RAMDISK_SIZE=$(wc -c < "$f")
-                case "$f" in
-                    *.gz) RAMDISK_COMP="gzip" ;; *.lz4) RAMDISK_COMP="lz4" ;; *.lzo) RAMDISK_COMP="lzop" ;;
-                    *.bz2) RAMDISK_COMP="bzip2" ;; *.xz) RAMDISK_COMP="xz" ;; *.zst) RAMDISK_COMP="zstd" ;;
-                    *) RAMDISK_COMP="none" ;;
-                esac
-                log_info "Found ramdisk in $vb: $f ($RAMDISK_COMP, ${RAMDISK_SIZE} bytes)"
-            done
-            rm -rf "$VB_UNPACK"
-        fi
-        rm -f "$TMP_VB_CHECK"
-    done
-fi
-
-rm -f "$TMP_BOOT"
+json_add_str "ramdisk_location" "$RAMDISK_LOCATION"
+json_add_str "ak3_recommended_block" "$AK3_RECOMMENDED_BLOCK"
+json_add_str "ak3_install_mode" "$AK3_INSTALL_MODE"
+json_add_str "ak3_ramdisk_compression" "$AK3_RAMDISK_COMPRESSION_OUT"
 
 # ============================================
 # 7. KERNEL MODULES
 # ============================================
 log_header "7. KERNEL MODULES INFO"
 
-MODULES_DIR="/vendor/lib/modules"
-[ -d "/system/lib/modules" ] && MODULES_DIR="/system/lib/modules"
-[ -d "/vendor_dlkm/lib/modules" ] && MODULES_DIR="/vendor_dlkm/lib/modules"
+# Priority: vendor_dlkm (GKI) > vendor > system  (read-only aware)
+MODULES_DIR=""
+for cand in /vendor_dlkm/lib/modules /vendor/lib/modules /system/lib/modules /system_ext/lib/modules; do
+    if [ -d "$cand" ] && [ -r "$cand" ]; then
+        MODULES_DIR="$cand"
+        break
+    fi
+done
 
 MODULES_JSON="[]"
 MODULE_COUNT=0
 
-if [ -d "$MODULES_DIR" ]; then
+if [ -n "$MODULES_DIR" ]; then
     log_info "Modules directory: $MODULES_DIR"
-    MODULE_LIST=$(ls "$MODULES_DIR"/*.ko 2>/dev/null | head -50)
-    if [ -n "$MODULE_LIST" ]; then
-        MODULE_COUNT=$(echo "$MODULE_LIST" | wc -l)
-        MODULES_JSON=$(echo "$MODULE_LIST" | xargs -n1 basename | sed 's/^/  "/;s/$/"/' | paste -sd, | sed 's/^/[/;s/$/]/')
+    # find is null-glob safe (ls *.ko would echo literal '*.ko' on empty dirs)
+    MODULE_LIST=$(find "$MODULES_DIR" -maxdepth 1 -name '*.ko' 2>/dev/null | head -50)
+    MODULE_COUNT=$(echo "$MODULE_LIST" | grep -c '\.ko$' 2>/dev/null)
+    [ -z "$MODULE_COUNT" ] && MODULE_COUNT=0
+    if [ "$MODULE_COUNT" -gt 0 ]; then
+        MODULES_JSON=$(echo "$MODULE_LIST" | xargs -n1 basename 2>/dev/null | sed 's/^/"/;s/$/"/' | paste -sd, | sed 's/^/[/;s/$/]/')
         echo "$MODULE_LIST" | head -20 | while IFS= read -r line; do
-            log_raw "$line"
+            log_raw "  $line"
         done
+        log_info "Found $MODULE_COUNT module(s)"
+    else
+        log_warn "Modules dir exists but contains no .ko files"
     fi
 else
-    log_warn "Modules directory not found"
+    log_warn "No readable modules directory under /vendor*, /system"
 fi
 
 # Loaded modules
-LOADED_MODULES=$(lsmod 2>/dev/null | tail -n +2 | awk '{print $1}' | sed 's/^/  "/;s/$/"/' | paste -sd, | sed 's/^/[/;s/$/]/')
-LOADED_COUNT=$(echo "$LOADED_MODULES" | tr -d '[]" ' | tr ',' '\n' | grep -v '^$' | wc -l)
+if command -v lsmod >/dev/null 2>&1; then
+    LOADED_LIST=$(lsmod 2>/dev/null | tail -n +2 | awk '{print $1}')
+else
+    LOADED_LIST=$(cut -d' ' -f1 /proc/modules 2>/dev/null)
+fi
+LOADED_COUNT=$(echo "$LOADED_LIST" | grep -c . 2>/dev/null)
+[ -z "$LOADED_COUNT" ] && LOADED_COUNT=0
 log_info "Loaded modules: $LOADED_COUNT"
+if [ "$LOADED_COUNT" -gt 0 ]; then
+    LOADED_MODULES=$(echo "$LOADED_LIST" | sed 's/^/"/;s/$/"/' | paste -sd, | sed 's/^/[/;s/$/]/')
+else
+    LOADED_MODULES="[]"
+fi
 
 json_add_str "modules_dir" "$MODULES_DIR"
 json_add "available_modules" "$MODULES_JSON"
@@ -506,89 +630,99 @@ log_info "$CMDLINE"
 json_add_str "kernel_cmdline" "$(json_escape "$CMDLINE")"
 
 # ============================================
-# 10. RAMDISK CONTENT ANALYSIS (from boot)
+# 10. RAMDISK CONTENT ANALYSIS  (uses RAMDISK_LOCATION from section 6)
 # ============================================
-log_header "10. RAMDISK CONTENT ANALYSIS (boot)"
+log_header "10. RAMDISK CONTENT ANALYSIS"
 
 KEY_FILES=""
 INIT_RC_FILES="[]"
 FSTAB_JSON=""
 
-log_step "Copying full boot image for analysis"
-TMP_BOOT="$TMP_DIR/boot_full.img"
-run_cmd dd if="$BOOT_IMG" of="$TMP_BOOT"
+# Decompress helper: <compressed_file> <out_file>
+decompress_to() {
+    local in="$1" out="$2"
+    case "$in" in
+        *.gz)  gunzip -c  "$in" > "$out" 2>/dev/null ;;
+        *.lz4) "$BIN_DIR/lz4" -dc "$in" > "$out" 2>/dev/null ;;
+        *.lzo) lzop -dc    "$in" > "$out" 2>/dev/null ;;
+        *.bz2) bzip2 -dc  "$in" > "$out" 2>/dev/null ;;
+        *.xz)  xz -dc     "$in" > "$out" 2>/dev/null ;;
+        *.zst) "$BIN_DIR/zstd" -dc "$in" > "$out" 2>/dev/null ;;
+        *)     cp "$in" "$out" 2>/dev/null ;;
+    esac
+    [ -s "$out" ] || return 1
+}
 
-if [ -x "$BIN_DIR/magiskboot" ]; then
-    log_step "Unpacking boot image with magiskboot"
-    MB_OUT_FILE="$TMP_DIR/mb_unpack_out.txt"
-    (
-        cd "$TMP_DIR" || exit 1
-        "$BIN_DIR/magiskboot" unpack "$TMP_BOOT" 2>&1
-    ) | tee "$MB_OUT_FILE" || log_warn "magiskboot unpack failed (ramdisk may be in vendor_boot)"
-    rm -f "$MB_OUT_FILE"
+# Skip content analysis if section 6 detected no real ramdisk
+if [ "$RAMDISK_LOCATION" = "boot_sar(empty)" ] || [ "$RAMDISK_LOCATION" = "none" ] || [ "$RAMDISK_LOCATION" = "recovery_only" ]; then
+    log_warn "Skipping ramdisk content analysis (location=$RAMDISK_LOCATION)"
+else
+    # Determine which partition holds the ramdisk we just probed
+    case "$RAMDISK_LOCATION" in
+        init_boot)   RAMDISK_SRC_PART="init_boot" ;;
+        vendor_boot) RAMDISK_SRC_PART="vendor_boot" ;;
+        boot|*)      RAMDISK_SRC_PART="boot" ;;
+    esac
+    RAMDISK_SRC=$(resolve_part "$RAMDISK_SRC_PART" 2>/dev/null || echo "$BOOT_IMG")
 
-    log_step "Checking for extracted ramdisk files"
-    ls -la "$TMP_DIR"/ramdisk* 2>/dev/null | while IFS= read -r line; do log_raw "  $line"; done
+    log_step "Copying full $RAMDISK_SRC_PART image for ramdisk content analysis"
+    TMP_BOOT="$TMP_DIR/content_full.img"
+    if ! safe_dd if="$RAMDISK_SRC" of="$TMP_BOOT" 2>/dev/null; then
+        log_warn "Cannot read $RAMDISK_SRC_PART for content analysis (read-only?)"
+    elif [ -x "$BIN_DIR/magiskboot" ]; then
+        WORK="$TMP_DIR/content_unpack"
+        rm -rf "$WORK"; mkdir -p "$WORK"
+        ( cd "$WORK" && "$BIN_DIR/magiskboot" unpack "$TMP_BOOT" >/dev/null 2>&1 ) || log_warn "magiskboot unpack failed (content)"
 
-    # Decompress ramdisk
-    log_step "Decompressing ramdisk"
-    for f in "$TMP_DIR"/ramdisk.cpio*; do
-        [ -f "$f" ] || continue
-        log_info "Found ramdisk file: $(basename "$f")"
-        case "$f" in
-            *.gz)  log_info "  -> gzip detected"; gunzip -c "$f" > "$TMP_DIR/ramdisk.cpio" 2>/dev/null ;;
-            *.lz4) log_info "  -> lz4 detected"; lz4 -dc "$f" > "$TMP_DIR/ramdisk.cpio" 2>/dev/null ;;
-            *.lzo) log_info "  -> lzop detected"; lzop -dc "$f" > "$TMP_DIR/ramdisk.cpio" 2>/dev/null ;;
-            *.bz2) log_info "  -> bzip2 detected"; bzip2 -dc "$f" > "$TMP_DIR/ramdisk.cpio" 2>/dev/null ;;
-            *.xz)  log_info "  -> xz detected"; xz -dc "$f" > "$TMP_DIR/ramdisk.cpio" 2>/dev/null ;;
-            *.zst) log_info "  -> zstd detected"; zstd -dc "$f" > "$TMP_DIR/ramdisk.cpio" 2>/dev/null ;;
-            *)     log_info "  -> no compression"; cp "$f" "$TMP_DIR/ramdisk.cpio" 2>/dev/null ;;
-        esac
-    done
+        log_step "Decompressing ramdisk"
+        CPIO_FILE=""
+        for f in "$WORK"/ramdisk.cpio*; do
+            [ -f "$f" ] || continue
+            log_info "Found ramdisk file: $(basename "$f")"
+            if decompress_to "$f" "$WORK/ramdisk.cpio" 2>/dev/null; then
+                CPIO_FILE="$WORK/ramdisk.cpio"
+                break
+            fi
+        done
 
-    if [ -f "$TMP_DIR/ramdisk.cpio" ]; then
-        RAMDISK_SIZE=$(wc -c < "$TMP_DIR/ramdisk.cpio")
-        log_info "Decompressed ramdisk size: $RAMDISK_SIZE bytes ($((RAMDISK_SIZE/1024)) KB)"
+        if [ -n "$CPIO_FILE" ] && [ -s "$CPIO_FILE" ]; then
+            log_info "Decompressed ramdisk: $(wc -c < "$CPIO_FILE") bytes"
+            EXTRACT_DIR="$WORK/extracted"
+            mkdir -p "$EXTRACT_DIR"
+            # cpio extraction in subshell is fine (no var assignment there now)
+            ( cd "$EXTRACT_DIR" && cpio -idm < "$CPIO_FILE" >/dev/null 2>&1 ) || log_warn "cpio extract failed"
 
-        log_step "Extracting ramdisk cpio archive"
-        mkdir -p "$TMP_DIR/ramdisk_extracted"
-        (
-            cd "$TMP_DIR/ramdisk_extracted" || exit 1
-            cpio -idm < ../ramdisk.cpio 2>&1 | while IFS= read -r line; do log_raw "  $line"; done
-
-            # Key files
+            # All file scanning/JSON building done in PARENT shell to preserve vars
             log_step "Searching for key ramdisk files"
-            for fname in init.rc fstab.* init.*.rc ueventd.rc sepolicy; do
-                find . -name "$fname" 2>/dev/null | head -5 | while IFS= read -r p; do
-                    log_info "  Found: $p"
-                    KEY_FILES="${KEY_FILES}\"${p}\","
+            for fname in init.rc fstab.qcom fstab.qcom-first-stage fstab.* init.*.rc ueventd.rc ueventd.*.rc sepolicy; do
+                find "$EXTRACT_DIR" -name "$fname" 2>/dev/null | head -5 | while IFS= read -r p; do
+                    rel=${p#$EXTRACT_DIR/}
+                    log_info "  Found: $rel"
+                    KEY_FILES="${KEY_FILES}\"$(json_escape "$rel")\","
                 done
             done
 
-            # All init rc files
             log_step "Listing all init RC files"
-            INIT_RC_FILES=$(find . -name "init*.rc" -o -name "ueventd*.rc" 2>/dev/null | sed 's/^/  "/;s/$/"/' | paste -sd, | sed 's/^/[/;s/$/]/')
-            log_info "Init RC files: $INIT_RC_FILES"
+            INIT_RC_LIST=$(find "$EXTRACT_DIR" -name "init*.rc" -o -name "ueventd*.rc" 2>/dev/null | sed "s#^$EXTRACT_DIR/##" | sort)
+            if [ -n "$INIT_RC_LIST" ]; then
+                INIT_RC_FILES=$(echo "$INIT_RC_LIST" | sed 's/^/"/;s/$/"/' | paste -sd, | sed 's/^/[/;s/$/]/')
+                log_info "Init RC files: $(echo "$INIT_RC_LIST" | tr '\n' ' ')"
+            fi
 
-            # Fstab entries
             log_step "Parsing fstab files"
-            for fstab in fstab.*; do
-                [ -f "$fstab" ] && {
-                    log_info "=== $fstab ==="
-                    cat "$fstab" | grep -v '^#' | grep -v '^$' | while IFS= read -r line; do
-                        log_info "  $line"
-                    done
-                    FSTAB_CONTENT=$(cat "$fstab" | grep -v '^#' | grep -v '^$' | json_escape)
-                    FSTAB_JSON="${FSTAB_JSON}{\"file\":\"$fstab\",\"content\":\"$FSTAB_CONTENT\"},"
-                }
+            for fstab in "$EXTRACT_DIR"/fstab.*; do
+                [ -f "$fstab" ] || continue
+                base=$(basename "$fstab")
+                log_info "=== $base ==="
+                FSTAB_CONTENT=$(grep -v '^#' "$fstab" 2>/dev/null | grep -v '^$' | json_escape)
+                [ -n "$FSTAB_CONTENT" ] && FSTAB_JSON="${FSTAB_JSON}{\"file\":\"$base\",\"content\":\"$FSTAB_CONTENT\"},"
             done
-        )
-    else
-        log_warn "No ramdisk.cpio found after extraction - ramdisk likely in vendor_boot"
+        else
+            log_warn "No ramdisk.cpio produced from $RAMDISK_SRC_PART content analysis"
+        fi
+        rm -rf "$WORK"
     fi
-    rm -rf "$TMP_DIR"/ramdisk* "$TMP_DIR"/kernel* "$TMP_DIR"/dt* "$TMP_DIR"/cmdline.txt "$TMP_DIR"/header "$TMP_DIR"/chromeos "$TMP_DIR"/ramdisk_extracted 2>/dev/null
-else
-    log_warn "magiskboot not available, skipping ramdisk content analysis"
+    rm -f "$TMP_BOOT"
 fi
 
 if [ -n "$FSTAB_JSON" ]; then
@@ -599,8 +733,6 @@ fi
 json_add "ramdisk_key_files" "[${KEY_FILES%,}]"
 json_add "init_rc_files" "$INIT_RC_FILES"
 json_add "fstab_entries" "$FSTAB_JSON"
-
-rm -f "$TMP_BOOT"
 
 # ============================================
 # 11. KERNEL CONFIG (IKCONFIG)
@@ -621,18 +753,18 @@ if [ -f /proc/config.gz ]; then
     log_info "Also copied to ${SCRIPT_DIR}/${DEVICE_CODENAME}_kernel_config.txt"
 elif [ -x "$BIN_DIR/magiskboot" ]; then
     TMP_BOOT="$TMP_DIR/boot_config.img"
-    run_cmd dd if="$BOOT_IMG" of="$TMP_BOOT"
+    safe_dd if="$BOOT_IMG" of="$TMP_BOOT" 2>/dev/null || log_warn "Cannot read boot for IKCONFIG fallback"
     MB_OUT_FILE="$TMP_DIR/mb_unpack_out.txt"
-    (
-        cd "$TMP_DIR" || exit 1
-        "$BIN_DIR/magiskboot" unpack "$TMP_BOOT" 2>&1
-    ) | tee "$MB_OUT_FILE" || log_warn "magiskboot unpack failed (section 11)"
-    rm -f "$MB_OUT_FILE"
-    if [ -f "$TMP_DIR/kernel" ]; then
-        "$BIN_DIR/magiskboot" decompress "$TMP_DIR/kernel" "$TMP_DIR/kernel_dec" 2>/dev/null
-        CONFIG_SAMPLE=$(strings "$TMP_DIR/kernel_dec" | grep -E '^CONFIG_' | head -30 | json_escape)
-        [ -n "$CONFIG_SAMPLE" ] && HAS_IKCONFIG=1
+    WORK="$TMP_DIR/ikconfig_unpack"; rm -rf "$WORK"; mkdir -p "$WORK"
+    if [ -s "$TMP_BOOT" ]; then
+        ( cd "$WORK" && "$BIN_DIR/magiskboot" unpack "$TMP_BOOT" >/dev/null 2>&1 ) || log_warn "magiskboot unpack failed (section 11)"
+        if [ -f "$WORK/kernel" ]; then
+            "$BIN_DIR/magiskboot" decompress "$WORK/kernel" "$WORK/kernel_dec" 2>/dev/null || true
+            CONFIG_SAMPLE=$(strings "$WORK/kernel_dec" 2>/dev/null | grep -E '^CONFIG_' | head -30 | json_escape)
+            [ -n "$CONFIG_SAMPLE" ] && HAS_IKCONFIG=1
+        fi
     fi
+    rm -rf "$WORK"; rm -f "$TMP_BOOT"
     rm -f "$TMP_BOOT" "$TMP_DIR"/kernel* 2>/dev/null
 else
     log_warn "IKCONFIG not available"
@@ -653,59 +785,43 @@ SEPOLICY_SIZE=0
 log_info "SELinux status: $SELINUX_STATUS"
 log_info "Policy version: $POLICY_VERS"
 
-log_step "Copying boot image for sepolicy extraction"
-TMP_BOOT="$TMP_DIR/boot_sepolicy.img"
-run_cmd dd if="$BOOT_IMG" of="$TMP_BOOT"
-
-if [ -x "$BIN_DIR/magiskboot" ]; then
-    log_step "Unpacking boot image with magiskboot"
-    MB_OUT_FILE="$TMP_DIR/mb_unpack_out.txt"
-    (
-        cd "$TMP_DIR" || exit 1
-        "$BIN_DIR/magiskboot" unpack "$TMP_BOOT" 2>&1
-    ) | tee "$MB_OUT_FILE" || log_warn "magiskboot unpack failed (section 12)"
-    rm -f "$MB_OUT_FILE"
-
-    log_step "Checking for extracted ramdisk files"
-    ls -la "$TMP_DIR"/ramdisk* 2>/dev/null | while IFS= read -r line; do log_raw "  $line"; done
-
-    # Decompress ramdisk
-    log_step "Decompressing ramdisk"
-    for f in "$TMP_DIR"/ramdisk.cpio*; do
-        [ -f "$f" ] || continue
-        log_info "Found ramdisk file: $(basename "$f")"
-        case "$f" in
-            *.gz)  log_info "  -> gzip detected"; gunzip -c "$f" > "$TMP_DIR/ramdisk.cpio" 2>/dev/null ;;
-            *.lz4) log_info "  -> lz4 detected"; lz4 -dc "$f" > "$TMP_DIR/ramdisk.cpio" 2>/dev/null ;;
-            *)     log_info "  -> no compression"; cp "$f" "$TMP_DIR/ramdisk.cpio" 2>/dev/null ;;
-        esac
-    done
-
-    if [ -f "$TMP_DIR/ramdisk.cpio" ]; then
-        RAMDISK_SIZE=$(wc -c < "$TMP_DIR/ramdisk.cpio")
-        log_info "Decompressed ramdisk size: $RAMDISK_SIZE bytes ($((RAMDISK_SIZE/1024)) KB)"
-
-        log_step "Extracting ramdisk cpio archive for sepolicy"
-        mkdir -p "$TMP_DIR/rd_sepolicy"
-        SEPOLICY_SIZE=$(
-            cd "$TMP_DIR/rd_sepolicy" || exit 1
-            cpio -idm < ../ramdisk.cpio 2>&1 | while IFS= read -r line; do log_raw "  $line"; done
-            if [ -f sepolicy ]; then
-                wc -c < sepolicy
+log_step "Sepolicy extraction (uses RAMDISK_LOCATION)"
+SEPOLICY_SIZE=0
+if [ "$RAMDISK_LOCATION" = "boot_sar(empty)" ] || [ "$RAMDISK_LOCATION" = "none" ] || [ "$RAMDISK_LOCATION" = "recovery_only" ]; then
+    log_warn "Skipping sepolicy extraction (location=$RAMDISK_LOCATION)"
+elif [ -x "$BIN_DIR/magiskboot" ]; then
+    case "$RAMDISK_LOCATION" in
+        init_boot)   SEP_PART="init_boot" ;;
+        vendor_boot) SEP_PART="vendor_boot" ;;
+        boot|*)      SEP_PART="boot" ;;
+    esac
+    SEP_SRC=$(resolve_part "$SEP_PART" 2>/dev/null || echo "$BOOT_IMG")
+    WORK="$TMP_DIR/sepolicy_unpack"
+    rm -rf "$WORK"; mkdir -p "$WORK"
+    if safe_dd if="$SEP_SRC" of="$WORK/src.img" 2>/dev/null; then
+        ( cd "$WORK" && "$BIN_DIR/magiskboot" unpack src.img >/dev/null 2>&1 ) || log_warn "magiskboot unpack failed (section 12)"
+        CPIO=""
+        for f in "$WORK"/ramdisk.cpio*; do
+            [ -f "$f" ] || continue
+            decompress_to "$f" "$WORK/ramdisk.cpio" 2>/dev/null && { CPIO="$WORK/ramdisk.cpio"; break; }
+        done
+        if [ -n "$CPIO" ] && [ -s "$CPIO" ]; then
+            SE="$WORK/extracted"; mkdir -p "$SE"
+            ( cd "$SE" && cpio -idm < "$CPIO" >/dev/null 2>&1 ) || true
+            if [ -f "$SE/sepolicy" ]; then
+                SEPOLICY_SIZE=$(wc -c < "$SE/sepolicy")
+                log_info "sepolicy in $SEP_PART ramdisk: ${SEPOLICY_SIZE} bytes"
             else
-                echo 0
+                log_info "sepolicy not in $SEP_PART ramdisk (may be in vendor sepolicy)"
             fi
-        )
-        [ -n "$SEPOLICY_SIZE" ] || SEPOLICY_SIZE=0
-        log_info "sepolicy in ramdisk: ${SEPOLICY_SIZE} bytes"
+        else
+            log_warn "No ramdisk.cpio from $SEP_PART for sepolicy extraction"
+        fi
     else
-        log_warn "No ramdisk.cpio found - sepolicy likely not in boot ramdisk"
+        log_warn "Cannot read $SEP_PART for sepolicy (read-only?)"
     fi
-    rm -rf "$TMP_DIR"/ramdisk* "$TMP_DIR"/kernel* "$TMP_DIR"/rd_sepolicy 2>/dev/null
-else
-    log_warn "magiskboot not available, skipping sepolicy extraction"
+    rm -rf "$WORK"
 fi
-rm -f "$TMP_BOOT"
 
 json_add_str "selinux_status" "$SELINUX_STATUS"
 json_add_str "selinux_policy_version" "$POLICY_VERS"
@@ -765,61 +881,36 @@ done
 GKI_JSON="{}"
 GKI_JSON=$(echo "$GKI_PROPS" | sed 's/\[\([^]]*\)\]: \(.*\)/"\1":"\2"/' | paste -sd, | sed 's/^/ {/;s/$/ }/')
 
-VENDOR_BOOT="/dev/block/by-name/vendor_boot"
-[ "$IS_AB" -eq 1 ] && [ -n "$SLOT_SUFFIX" ] && VENDOR_BOOT="/dev/block/by-name/vendor_boot$SLOT_SUFFIX"
-
+VENDOR_BOOT=$(resolve_part vendor_boot 2>/dev/null || echo "")
 VB_HEADER_JSON="{}"
 VENDOR_BOOT_RAMDISK_COMP="unknown"
 VENDOR_BOOT_RAMDISK_SIZE=0
-if [ -e "$VENDOR_BOOT" ]; then
-    log_info "vendor_boot found: $VENDOR_BOOT"
-    TMP_VB="$TMP_DIR/vendor_boot_header.img"
-    run_cmd dd if="$VENDOR_BOOT" of="$TMP_VB" bs=4096 count=1
-    if [ -x "$BIN_DIR/magiskboot" ]; then
-        VB_OUT_FILE="$TMP_DIR/mb_vb_out.txt"
-        (
-            "$BIN_DIR/magiskboot" unpack -h "$TMP_VB" 2>&1
-        ) | tee "$VB_OUT_FILE"
-        VB_OUT=$(cat "$VB_OUT_FILE" 2>/dev/null)
-        echo "$VB_OUT" | head -20 | while IFS= read -r line; do
-            log_raw "$line"
-        done
-        VB_HEADER_JSON=$(echo "$VB_OUT" | grep -E '^[A-Z_]+=' | sed 's/\([^=]*\)=\(.*\)/"\1":"\2"/' | paste -sd, | sed 's/^/ {/;s/$/ }/')
-        rm -f "$VB_OUT_FILE"
+if [ -n "$VENDOR_BOOT" ] && part_readable "$VENDOR_BOOT"; then
+    log_info "vendor_boot present: $VENDOR_BOOT"
+    # Pull header to a temp, read header version so we don't re-unpack big image
+    TMP_VB="$TMP_DIR/vendor_boot_hdr.img"
+    if safe_dd if="$VENDOR_BOOT" of="$TMP_VB" bs=4096 count=1 2>/dev/null; then
+        VB_HDR_VER=$(dd if="$TMP_VB" bs=1 skip=24 count=4 2>/dev/null | od -An -tu4 | tr -d ' \n' || echo "0")
+        [ -z "$VB_HDR_VER" ] && VB_HDR_VER=0
+        # vendor_ramdisk_size lives at different offset per header version; parse SDK-style only if v3+
+        VB_RAMDISK_SZ_HDR=$(dd if="$TMP_VB" bs=1 skip=12 count=4 2>/dev/null | od -An -tu4 | tr -d ' \n' || echo "0")
+        VB_HEADER_JSON="{\"header_version\":\"$VB_HDR_VER\",\"ramdisk_sz_header\":\"$VB_RAMDISK_SZ_HDR\"}"
+        log_info "  vendor_boot header v$VB_HDR_VER, ramdisk_sz(header)=$VB_RAMDISK_SZ_HDR"
     fi
     rm -f "$TMP_VB"
-
-    # Also unpack full vendor_boot for ramdisk (GKI devices)
-    log_step "Extracting ramdisk from vendor_boot"
-    TMP_VB_FULL="$TMP_DIR/vendor_boot_full.img"
-    run_cmd dd if="$VENDOR_BOOT" of="$TMP_VB_FULL"
-    if [ -x "$BIN_DIR/magiskboot" ]; then
-        MB_OUT_FILE="$TMP_DIR/mb_vb_unpack_out.txt"
-        (
-            cd "$TMP_DIR" || exit 1
-            "$BIN_DIR/magiskboot" unpack "$TMP_VB_FULL" 2>&1
-        ) | tee "$MB_OUT_FILE" || log_warn "magiskboot unpack failed (vendor_boot full)"
-        rm -f "$MB_OUT_FILE"
-        for f in "$TMP_DIR"/ramdisk.cpio*; do
-            [ -f "$f" ] && VENDOR_BOOT_RAMDISK_SIZE=$(wc -c < "$f") && case "$f" in
-                *.gz)  VENDOR_BOOT_RAMDISK_COMP="gzip" ;;
-                *.lz4) VENDOR_BOOT_RAMDISK_COMP="lz4" ;;
-                *.lzo) VENDOR_BOOT_RAMDISK_COMP="lzop" ;;
-                *.bz2) VENDOR_BOOT_RAMDISK_COMP="bzip2" ;;
-                *.xz)  VENDOR_BOOT_RAMDISK_COMP="xz" ;;
-                *.zst) VENDOR_BOOT_RAMDISK_COMP="zstd" ;;
-                *)     VENDOR_BOOT_RAMDISK_COMP="none" ;;
-            esac
-        done
-        rm -f "$TMP_DIR"/ramdisk.cpio* "$TMP_DIR"/kernel* "$TMP_DIR"/dt* "$TMP_DIR"/cmdline.txt "$TMP_DIR"/header 2>/dev/null
+    # Detailed ramdisk compression/size come from section 6 probe result via RAMDISK_LOCATION
+    if [ "$RAMDISK_LOCATION" = "vendor_boot" ]; then
+        VENDOR_BOOT_RAMDISK_COMP="$RAMDISK_COMP"
+        VENDOR_BOOT_RAMDISK_SIZE="$RAMDISK_SIZE"
     fi
-    rm -f "$TMP_VB_FULL"
+else
+    log_info "vendor_boot not present"
+    VENDOR_BOOT=""
 fi
 
-INIT_BOOT="/dev/block/by-name/init_boot"
-[ "$IS_AB" -eq 1 ] && [ -n "$SLOT_SUFFIX" ] && INIT_BOOT="/dev/block/by-name/init_boot$SLOT_SUFFIX"
+INIT_BOOT=$(resolve_part init_boot 2>/dev/null || echo "")
 HAS_INIT_BOOT=0
-[ -e "$INIT_BOOT" ] && HAS_INIT_BOOT=1 && log_info "init_boot found: $INIT_BOOT"
+[ -n "$INIT_BOOT" ] && part_readable "$INIT_BOOT" 2>/dev/null && HAS_INIT_BOOT=1 && log_info "init_boot present: $INIT_BOOT"
 
 json_add "gki_props" "$GKI_JSON"
 json_add "vendor_boot_header" "$VB_HEADER_JSON"
@@ -836,30 +927,25 @@ log_header "15. RECOVERY PARTITION"
 RECOVERY="/dev/block/by-name/recovery"
 [ "$IS_AB" -eq 1 ] && [ -n "$SLOT_SUFFIX" ] && RECOVERY="/dev/block/by-name/recovery$SLOT_SUFFIX"
 
+RECOVERY=$(resolve_part recovery 2>/dev/null || echo "")
 RECOVERY_JSON="{}"
-if [ -e "$RECOVERY" ]; then
+if [ -z "$RECOVERY" ]; then
+    log_info "No separate recovery partition (recovery-in-boot)"
+    RECOVERY_JSON="{\"has_separate_recovery\":0}"
+else
     REC_SIZE=$(blockdev --getsize64 "$RECOVERY" 2>/dev/null || echo 0)
     REC_MB=$((REC_SIZE/1024/1024))
     log_info "Recovery: $RECOVERY (${REC_MB} MB)"
-    TMP_REC="$TMP_DIR/recovery_header.img"
-    run_cmd dd if="$RECOVERY" of="$TMP_REC" bs=4096 count=1
-    if [ -x "$BIN_DIR/magiskboot" ]; then
-        REC_OUT_FILE="$TMP_DIR/mb_rec_out.txt"
-        (
-            "$BIN_DIR/magiskboot" unpack -h "$TMP_REC" 2>&1
-        ) | tee "$REC_OUT_FILE"
-        REC_OUT=$(cat "$REC_OUT_FILE" 2>/dev/null)
-        echo "$REC_OUT" | head -10 | while IFS= read -r line; do
-            log_raw "$line"
-        done
-        RECOVERY_JSON=$(echo "$REC_OUT" | grep -E '^[A-Z_]+=' | sed 's/\([^=]*\)=\(.*\)/"\1":"\2"/' | paste -sd, | sed 's/^/ {/;s/$/ }/')
-        rm -f "$REC_OUT_FILE"
+    TMP_REC="$TMP_DIR/recovery_hdr.img"
+    REC_HDR_VER="unknown"
+    if safe_dd if="$RECOVERY" of="$TMP_REC" bs=4096 count=1 2>/dev/null; then
+        REC_MAGIC=$(dd if="$TMP_REC" bs=1 count=8 2>/dev/null | od -An -tx1 | tr -d ' \n' || echo "")
+        if [ "$REC_MAGIC" = "414e44524f494421" ]; then
+            REC_HDR_VER=$(dd if="$TMP_REC" bs=1 skip=24 count=4 2>/dev/null | od -An -tu4 | tr -d ' \n' || echo "0")
+        fi
     fi
+    RECOVERY_JSON="{\"path\":\"$RECOVERY\",\"size_mb\":$REC_MB,\"header_version\":\"$REC_HDR_VER\"}"
     rm -f "$TMP_REC"
-    RECOVERY_JSON="{\"path\":\"$RECOVERY\",\"size_mb\":$REC_MB,\"header\":$RECOVERY_JSON}"
-else
-    log_info "No separate recovery partition (recovery-in-boot)"
-    RECOVERY_JSON="{\"has_separate_recovery\":0}"
 fi
 
 json_add "recovery" "$RECOVERY_JSON"
@@ -870,40 +956,43 @@ json_add "recovery" "$RECOVERY_JSON"
 log_header "16. DTB / DTBO DETAILS"
 
 DTB_JSON="{}"
-TMP_BOOT="$TMP_DIR/boot_dtb.img"
-run_cmd dd if="$BOOT_IMG" of="$TMP_BOOT"
+# Reuse the partition determined by section 6 for DTB source (boot or vendor_boot)
+case "$RAMDISK_LOCATION" in
+    init_boot|vendor_boot) DTB_SRC_PART="$RAMDISK_LOCATION" ;;
+    *)                     DTB_SRC_PART="boot" ;;
+esac
+DTB_SRC=$(resolve_part "$DTB_SRC_PART" 2>/dev/null || echo "$BOOT_IMG")
+TMP_BOOT="$TMP_DIR/dtb_src.img"
 
-if [ -x "$BIN_DIR/magiskboot" ]; then
-    MB_OUT_FILE="$TMP_DIR/mb_dtb_unpack_out.txt"
-    (
-        cd "$TMP_DIR" || exit 1
-        "$BIN_DIR/magiskboot" unpack "$TMP_BOOT" 2>&1
-    ) | tee "$MB_OUT_FILE" || log_warn "magiskboot unpack failed (DTB)"
-    rm -f "$MB_OUT_FILE"
+if [ -x "$BIN_DIR/magiskboot" ] && safe_dd if="$DTB_SRC" of="$TMP_BOOT" 2>/dev/null; then
+    WORK="$TMP_DIR/dtb_unpack"
+    rm -rf "$WORK"; mkdir -p "$WORK"
+    ( cd "$WORK" && "$BIN_DIR/magiskboot" unpack "$TMP_BOOT" >/dev/null 2>&1 ) || log_warn "magiskboot unpack failed (DTB)"
     for dtb in dtb dtb.img kernel_dtb; do
-        if [ -f "$TMP_DIR/$dtb" ]; then
-            DTB_SIZE=$(wc -c < "$TMP_DIR/$dtb")
+        if [ -f "$WORK/$dtb" ]; then
+            DTB_SIZE=$(wc -c < "$WORK/$dtb" 2>/dev/null || echo 0)
             log_info "Found $dtb: ${DTB_SIZE} bytes"
-            # Try fdtget
-            FDT_OUT=""
-            if command -v fdtget >/dev/null 2>&1; then
-                FDT_OUT=$(fdtget / "$TMP_DIR/$dtb" 2>/dev/null | head -10 | json_escape)
-                log_info "  fdtget: $FDT_OUT"
+            FDT_MODEL=""; FDT_COMPAT=""
+            # CORRECT fdtget usage: fdtget <file> <node> <property>
+            if [ -x "$BIN_DIR/fdtget" ]; then
+                FDT_MODEL=$("$BIN_DIR/fdtget" "$WORK/$dtb" / model 2>/dev/null)
+                FDT_COMPAT=$("$BIN_DIR/fdtget" "$WORK/$dtb" / compatible 2>/dev/null | tr '\n' ' ')
+                [ -n "$FDT_MODEL" ]   && log_info "  fdtget / model: $FDT_MODEL"
+                [ -n "$FDT_COMPAT" ] && log_info "  fdtget / compatible: $FDT_COMPAT"
             fi
-            # Board info from strings
-            BOARD_STR=$(strings "$TMP_DIR/$dtb" | grep -iE 'board|model|compatible' | head -5 | json_escape)
-            log_info "  Board strings: $BOARD_STR"
-            DTB_JSON="{\"file\":\"$dtb\",\"size\":$DTB_SIZE,\"fdtget\":\"$FDT_OUT\",\"board_strings\":\"$BOARD_STR\"}"
+            # Keep board_strings via fdtget only — strings grep on compiled DTB is unreliable
+            DTB_JSON="{\"file\":\"$dtb\",\"size\":$DTB_SIZE,\"model\":\"$(json_escape "$FDT_MODEL")\",\"compatible\":\"$(json_escape "$FDT_COMPAT")\"}"
+            break
         fi
     done
-    rm -f "$TMP_DIR"/dtb* "$TMP_DIR"/kernel* "$TMP_DIR"/ramdisk* 2>/dev/null
+    rm -rf "$WORK"
 fi
+rm -f "$TMP_BOOT"
 
 # dtbo partition
-DTBO="/dev/block/by-name/dtbo"
-[ "$IS_AB" -eq 1 ] && [ -n "$SLOT_SUFFIX" ] && DTBO="/dev/block/by-name/dtbo$SLOT_SUFFIX"
+DTBO=$(resolve_part dtbo 2>/dev/null || echo "")
 DTBO_JSON="{}"
-if [ -e "$DTBO" ]; then
+if [ -n "$DTBO" ] && part_readable "$DTBO"; then
     DTBO_SIZE=$(blockdev --getsize64 "$DTBO" 2>/dev/null || echo 0)
     DTBO_MB=$((DTBO_SIZE/1024/1024))
     log_info "dtbo partition: $DTBO (${DTBO_MB} MB)"
@@ -913,17 +1002,14 @@ fi
 json_add "dtb_info" "$DTB_JSON"
 json_add "dtbo_partition" "$DTBO_JSON"
 
-rm -f "$TMP_BOOT"
-
 # ============================================
 # 17. FINALIZE JSON
 # ============================================
 log_header "17. FINALIZING OUTPUT"
 
-# Add metadata
+# Add metadata (do NOT re-emit device_codename — already added in section 1)
 json_add_str "collected_at" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-json_add_str "script_version" "2.0"
-json_add_str "device_codename" "$DEVICE_CODENAME"
+json_add_str "script_version" "2.1"
 
 json_finalize
 
@@ -938,12 +1024,28 @@ log_header "18. ANYKERNEL3 CONFIG SUMMARY"
 log_raw ""
 log_raw "# ========================================="
 log_raw "# COPY THIS TO your anykernel.sh"
+log_raw "# (auto-derived from probe results — review before use)"
 log_raw "# ========================================="
 log_raw ""
+
+# Build the AK3-supported.versions string  (Android release, NOT SDK).
+# AK3 README format: "8.1.0" or "7.1.2 - 9". When SDK-based fallback is needed
+# (only if ANDROID_VER unreadable), we skip the line so AK3 disables the check
+# (cleaner than emitting an SDK int that never matches a real release string).
+if [ -n "$ANDROID_VER" ] && [ "$ANDROID_VER" != "N/A" ]; then
+    SUPPORTED_VERSIONS_LINE="supported.versions=$ANDROID_VER"
+else
+    SUPPORTED_VERSIONS_LINE="# supported.versions=  # Android version unreadable - check disabled"
+fi
+
+# Patchlevel: AK3 expects YYYY-MM. Truncate to 7 chars defensively.
+patch_ym() { echo "$1" | cut -c1-7; }
+SP_YM=$(patch_ym "$SECURITY_PATCH"); VP_YM=$(patch_ym "$VENDOR_PATCH")
+
 log_raw "properties() { '"
 log_raw "kernel.string=YourKernelName by YourName"
 log_raw "do.devicecheck=1"
-log_raw "do.modules=0          # Set 1 if you have modules in modules/"
+log_raw "do.modules=$([ "$MODULE_COUNT" -gt 0 ] 2>/dev/null && echo 1 || echo 0)          # ${MODULE_COUNT:-0} module(s) detected"
 log_raw "do.systemless=1"
 log_raw "do.cleanup=1"
 log_raw "do.cleanuponabort=0"
@@ -962,24 +1064,34 @@ while [ $IDX -le 5 ]; do
     IDX=$((IDX + 1))
 done
 
-log_raw "supported.versions=$ANDROID_SDK"
-log_raw "supported.patchlevels=$SECURITY_PATCH"
-log_raw "supported.vendorpatchlevels=$VENDOR_PATCH"
+log_raw "$SUPPORTED_VERSIONS_LINE"
+[ -n "$SP_YM" ] && [ "$SP_YM" != "N/A" ] && log_raw "supported.patchlevels=$SP_YM"
+[ -n "$VP_YM" ] && [ "$VP_YM" != "N/A" ] && log_raw "supported.vendorpatchlevels=$VP_YM"
 log_raw "'; }"
 log_raw ""
-log_raw "# Boot partition config"
-log_raw "BLOCK=auto"
+log_raw "# Boot partition config (derived from probe: ramdisk_location=$RAMDISK_LOCATION)"
+log_raw "BLOCK=$AK3_RECOMMENDED_BLOCK"
 log_raw "IS_SLOT_DEVICE=$IS_AB"
-log_raw "RAMDISK_COMPRESSION=auto"
+log_raw "RAMDISK_COMPRESSION=$AK3_RAMDISK_COMPRESSION_OUT"
 log_raw "PATCH_VBMETA_FLAG=auto"
 log_raw ""
 log_raw "# Import core"
 log_raw ". tools/ak3-core.sh"
 log_raw ""
 log_raw "# Install"
-log_raw "dump_boot"
-log_raw "# ... your patches here ..."
-log_raw "write_boot"
+if echo "$AK3_INSTALL_MODE" | grep -q split_boot; then
+    log_raw "split_boot   # no ramdisk unpack (ramdisk location: $RAMDISK_LOCATION)"
+    log_raw "# ... your kernel-only patches here ..."
+    log_raw "flash_boot"
+else
+    log_raw "dump_boot"
+    log_raw "# ... your ramdisk patches here ..."
+    log_raw "write_boot"
+fi
+log_raw ""
+log_raw "# Probe summary:"
+log_raw "## ramdisk_location=$RAMDISK_LOCATION  comp=$RAMDISK_COMP  size=${RAMDISK_SIZE}B"
+log_raw "## boot_header_version=$HDR_VER  is_ab=$IS_AB  ramdisk_size_header=${RAMDISK_SZ}B"
 
 # ============================================
 # DONE
