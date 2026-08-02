@@ -868,7 +868,7 @@ log_header "11. KERNEL CONFIG (IKCONFIG)"
 
 KERNEL_CONFIG_JSON="{}"
 HAS_IKCONFIG=0
-CONFIG_FILE="${SCRIPT_DIR}/${DEVICE_CODENAME}_kernel_config.txt"
+CONFIG_FILE="${SCRIPT_DIR}/${DEVICE_CODENAME}.devconfig"
 CONFIG_SAMPLE=""
 
 if [ -f /proc/config.gz ]; then
@@ -1242,5 +1242,5 @@ log_raw "## boot_header_version=$HDR_VER  is_ab=$IS_AB  ramdisk_size_header=${RA
 log_header "DONE"
 log_info "JSON output: $JSON_FILE"
 log_info "Log output: $LOG_FILE"
-log_info "Kernel config (if found): ${SCRIPT_DIR}/${DEVICE_CODENAME}_kernel_config.txt"
+log_info "Kernel config (if found): ${SCRIPT_DIR}/${DEVICE_CODENAME}.devconfig"
 log_info "Use JSON with: cat $JSON_FILE | jq ."
