@@ -868,36 +868,47 @@ log_header "11. KERNEL CONFIG (IKCONFIG)"
 
 KERNEL_CONFIG_JSON="{}"
 HAS_IKCONFIG=0
+CONFIG_FILE="${SCRIPT_DIR}/${DEVICE_CODENAME}_kernel_config.txt"
+CONFIG_SAMPLE=""
 
 if [ -f /proc/config.gz ]; then
     log_info "Found /proc/config.gz"
-    zcat /proc/config.gz > "$TMP_DIR/kernel_config_full.txt"
-    CONFIG_LINES=$(zcat /proc/config.gz | wc -l)
-    CONFIG_SAMPLE=$(zcat /proc/config.gz | head -30 | json_escape)
-    HAS_IKCONFIG=1
-    log_info "Config lines: $CONFIG_LINES (saved to $TMP_DIR/kernel_config_full.txt)"
-    cp "$TMP_DIR/kernel_config_full.txt" "${SCRIPT_DIR}/${DEVICE_CODENAME}_kernel_config.txt"
-    log_info "Also copied to ${SCRIPT_DIR}/${DEVICE_CODENAME}_kernel_config.txt"
+    if zcat /proc/config.gz > "$TMP_DIR/kernel_config_full.txt" 2>/dev/null; then
+        CONFIG_LINES=$(wc -l < "$TMP_DIR/kernel_config_full.txt" 2>/dev/null | tr -d ' ')
+        # Extract first 30 CONFIG_ lines for JSON sample (single-line, escaped)
+        CONFIG_SAMPLE=$(grep -E '^CONFIG_' "$TMP_DIR/kernel_config_full.txt" 2>/dev/null | head -30 | tr '\n' ';' | json_escape)
+        HAS_IKCONFIG=1
+        log_info "Config lines: $CONFIG_LINES"
+        cp "$TMP_DIR/kernel_config_full.txt" "$CONFIG_FILE" 2>/dev/null && \
+            log_info "Saved full config to $CONFIG_FILE" || \
+            log_warn "Failed to copy config to $CONFIG_FILE"
+    else
+        log_warn "Cannot read /proc/config.gz (permission?)"
+    fi
 elif [ -x "$BIN_DIR/magiskboot" ]; then
+    # Fallback: try extract from boot image via magiskboot
     TMP_BOOT="$TMP_DIR/boot_config.img"
     safe_dd if="$BOOT_IMG" of="$TMP_BOOT" 2>/dev/null || log_warn "Cannot read boot for IKCONFIG fallback"
-    MB_OUT_FILE="$TMP_DIR/mb_unpack_out.txt"
     WORK="$TMP_DIR/ikconfig_unpack"; rm -rf "$WORK"; mkdir -p "$WORK"
     if [ -s "$TMP_BOOT" ]; then
         ( cd "$WORK" && "$BIN_DIR/magiskboot" unpack "$TMP_BOOT" >/dev/null 2>&1 ) || log_warn "magiskboot unpack failed (section 11)"
         if [ -f "$WORK/kernel" ]; then
             "$BIN_DIR/magiskboot" decompress "$WORK/kernel" "$WORK/kernel_dec" 2>/dev/null || true
-            CONFIG_SAMPLE=$(strings "$WORK/kernel_dec" 2>/dev/null | grep -E '^CONFIG_' | head -30 | json_escape)
+            CONFIG_SAMPLE=$(strings "$WORK/kernel_dec" 2>/dev/null | grep -E '^CONFIG_' | head -30 | tr '\n' ';' | json_escape)
             [ -n "$CONFIG_SAMPLE" ] && HAS_IKCONFIG=1
+            if [ "$HAS_IKCONFIG" -eq 1 ]; then
+                strings "$WORK/kernel_dec" 2>/dev/null | grep -E '^CONFIG_' > "$TMP_DIR/kernel_config_full.txt" 2>/dev/null
+                cp "$TMP_DIR/kernel_config_full.txt" "$CONFIG_FILE" 2>/dev/null && \
+                    log_info "Saved extracted config to $CONFIG_FILE"
+            fi
         fi
     fi
     rm -rf "$WORK"; rm -f "$TMP_BOOT"
-    rm -f "$TMP_BOOT" "$TMP_DIR"/kernel* 2>/dev/null
 else
-    log_warn "IKCONFIG not available"
+    log_warn "IKCONFIG not available (/proc/config.gz missing and no magiskboot)"
 fi
 
-KERNEL_CONFIG_JSON="{\"has_ikconfig\":$HAS_IKCONFIG,\"sample\":\"$CONFIG_SAMPLE\"}"
+KERNEL_CONFIG_JSON="{\"has_ikconfig\":$HAS_IKCONFIG,\"sample\":\"$CONFIG_SAMPLE\",\"config_file\":\"$(json_escape "$CONFIG_FILE")\"}"
 json_add "kernel_config" "$KERNEL_CONFIG_JSON"
 
 # ============================================
