@@ -694,13 +694,21 @@ else
 
             # All file scanning/JSON building done in PARENT shell to preserve vars
             log_step "Searching for key ramdisk files"
-            for fname in init.rc fstab.qcom fstab.qcom-first-stage fstab.* init.*.rc ueventd.rc ueventd.*.rc sepolicy; do
-                find "$EXTRACT_DIR" -name "$fname" 2>/dev/null | head -5 | while IFS= read -r p; do
-                    rel=${p#$EXTRACT_DIR/}
+            # Build KEY_FILES in PARENT shell (command substitution, not `| while read`
+            # which would run in a subshell and discard the variable mutation).
+            KEY_LIST=$(for fname in init.rc fstab.qcom fstab.qcom-first-stage fstab.* init.*.rc ueventd.rc ueventd.*.rc sepolicy; do
+                find "$EXTRACT_DIR" -name "$fname" 2>/dev/null | head -5
+            done | sed "s#^$EXTRACT_DIR/##" | sort -u)
+            if [ -n "$KEY_LIST" ]; then
+                while IFS= read -r rel; do
+                    [ -n "$rel" ] || continue
                     log_info "  Found: $rel"
                     KEY_FILES="${KEY_FILES}\"$(json_escape "$rel")\","
-                done
-            done
+                done <<EOF
+$(printf '%s\n' "$KEY_LIST")
+EOF
+            fi
+            unset KEY_LIST
 
             log_step "Listing all init RC files"
             INIT_RC_LIST=$(find "$EXTRACT_DIR" -name "init*.rc" -o -name "ueventd*.rc" 2>/dev/null | sed "s#^$EXTRACT_DIR/##" | sort)
