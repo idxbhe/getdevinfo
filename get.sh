@@ -155,6 +155,10 @@ mkdir -p "$TMP_DIR"
 DEVICE_CODENAME=$(get_prop ro.product.device)
 BUILD_PRODUCT=$(get_prop ro.build.product)
 VENDOR_DEVICE=$(get_prop ro.product.vendor.device)
+# 4th device prop checked by AK3 do_devicecheck (update-binary:299). Lavender
+# usually returns empty here, but on other devices it often differs from the
+# other three, and AK3 needs all matching names in device.name#.
+VENDOR_PRODUCT_DEVICE=$(get_prop ro.vendor.product.device)
 
 OUT_BASE="${SCRIPT_DIR}/${DEVICE_CODENAME}"
 JSON_FILE="${OUT_BASE}.json"
@@ -194,6 +198,7 @@ BOARD=$(get_prop ro.board.platform)
 log_info "ro.product.device        : $DEVICE_CODENAME"
 log_info "ro.build.product         : $BUILD_PRODUCT"
 log_info "ro.product.vendor.device : $VENDOR_DEVICE"
+log_info "ro.vendor.product.device : $VENDOR_PRODUCT_DEVICE"
 log_info "ro.product.model         : $MODEL"
 log_info "ro.product.brand         : $BRAND"
 log_info "ro.product.manufacturer  : $MANUFACTURER"
@@ -204,6 +209,7 @@ log_info "ro.board.platform        : $BOARD"
 AK_CODENAMES="$DEVICE_CODENAME"
 [ "$BUILD_PRODUCT" != "$DEVICE_CODENAME" ] && [ "$BUILD_PRODUCT" != "N/A" ] && AK_CODENAMES="$AK_CODENAMES $BUILD_PRODUCT"
 [ "$VENDOR_DEVICE" != "$DEVICE_CODENAME" ] && [ "$VENDOR_DEVICE" != "N/A" ] && AK_CODENAMES="$AK_CODENAMES $VENDOR_DEVICE"
+[ "$VENDOR_PRODUCT_DEVICE" != "$DEVICE_CODENAME" ] && [ "$VENDOR_PRODUCT_DEVICE" != "N/A" ] && [ -n "$VENDOR_PRODUCT_DEVICE" ] && AK_CODENAMES="$AK_CODENAMES $VENDOR_PRODUCT_DEVICE"
 AK_CODENAMES=$(echo "$AK_CODENAMES" | tr ' ' '\n' | sort -u | tr '\n' ',' | sed 's/,$//')
 
 log_info "AnyKernel device.names: $AK_CODENAMES"
@@ -211,6 +217,7 @@ log_info "AnyKernel device.names: $AK_CODENAMES"
 json_add_str "device_codename" "$DEVICE_CODENAME"
 json_add_str "build_product" "$BUILD_PRODUCT"
 json_add_str "vendor_device" "$VENDOR_DEVICE"
+json_add_str "vendor_product_device" "$VENDOR_PRODUCT_DEVICE"
 json_add_str "model" "$MODEL"
 json_add_str "brand" "$BRAND"
 json_add_str "manufacturer" "$MANUFACTURER"
@@ -725,6 +732,22 @@ CMDLINE=$(cat /proc/cmdline)
 log_info "$CMDLINE"
 json_add_str "kernel_cmdline" "$(json_escape "$CMDLINE")"
 
+# Extract active DT indexes from cmdline: androidboot.dtbo_idx=<n> and
+# androidboot.dtb_idx=<n>. Useful for the AK3 builder to pick the right DTB
+# variant on multi-DTB devices (lavender: dtb_idx=2, dtbo_idx=0).
+DTBO_IDX=""
+DTB_IDX=""
+for tok in $CMDLINE; do
+    case "$tok" in
+        androidboot.dtbo_idx=*) DTBO_IDX=${tok#*=} ;;
+        androidboot.dtb_idx=*)  DTB_IDX=${tok#*=} ;;
+    esac
+done
+log_info "androidboot.dtbo_idx: ${DTBO_IDX:-N/A}"
+log_info "androidboot.dtb_idx:  ${DTB_IDX:-N/A}"
+json_add_str "dtbo_idx" "$DTBO_IDX"
+json_add_str "dtb_idx" "$DTB_IDX"
+
 # ============================================
 # 10. RAMDISK CONTENT ANALYSIS  (uses RAMDISK_LOCATION from section 6)
 # ============================================
@@ -1016,12 +1039,20 @@ INIT_BOOT=$(resolve_part init_boot 2>/dev/null || echo "")
 HAS_INIT_BOOT=0
 [ -n "$INIT_BOOT" ] && part_readable "$INIT_BOOT" 2>/dev/null && HAS_INIT_BOOT=1 && log_info "init_boot present: $INIT_BOOT"
 
+# vendor_kernel_boot: separate partition on some hdr-v4 devices (dtb-only).
+# AK3 auto-flashes it in write_boot (ak3-core:570). Not present on lavender.
+VENDOR_KERNEL_BOOT=$(resolve_part vendor_kernel_boot 2>/dev/null || echo "")
+HAS_VENDOR_KERNEL_BOOT=0
+[ -n "$VENDOR_KERNEL_BOOT" ] && part_readable "$VENDOR_KERNEL_BOOT" 2>/dev/null && HAS_VENDOR_KERNEL_BOOT=1 && log_info "vendor_kernel_boot present: $VENDOR_KERNEL_BOOT"
+
 json_add "gki_props" "$GKI_JSON"
 json_add "vendor_boot_header" "$VB_HEADER_JSON"
 json_add_str "vendor_boot_ramdisk_compression" "$VENDOR_BOOT_RAMDISK_COMP"
 json_add_str "vendor_boot_ramdisk_size_bytes" "$VENDOR_BOOT_RAMDISK_SIZE"
 json_add_str "has_init_boot" "$HAS_INIT_BOOT"
 json_add_str "init_boot_path" "$INIT_BOOT"
+json_add_str "has_vendor_kernel_boot" "$HAS_VENDOR_KERNEL_BOOT"
+json_add_str "vendor_kernel_boot_path" "$VENDOR_KERNEL_BOOT"
 
 # ============================================
 # 15. RECOVERY PARTITION
