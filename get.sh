@@ -405,9 +405,17 @@ if resolve_part boot >/dev/null 2>&1; then
                 case "$line" in
                     *'['*']'*)
                         key=${line%%\[*}; key=$(echo "$key" | sed 's/^[ 	]*//;s/[ 	]*$//')
-                        val=${line#*[}; val=${val%]*}
-                        vesc=$(json_escape "$val")
-                        [ -n "$key" ] && printf '"%s":"%s",\n' "$key" "$vesc" >> "$HDR_PAIRS_FILE"
+                        # Allowlist: magiskboot header fields are UPPER_CASE
+                        # identifiers. Reject magiskboot banner lines like
+                        # "Parsing boot image:" (has lowercase/spaces/colon) so
+                        # they don't become bogus JSON keys in boot_header.
+                        case "$key" in
+                            [A-Z_][A-Z0-9_]*)
+                                val=${line#*[}; val=${val%]*}
+                                vesc=$(json_escape "$val")
+                                printf '"%s":"%s",\n' "$key" "$vesc" >> "$HDR_PAIRS_FILE"
+                                ;;
+                        esac
                         ;;
                 esac
             done
@@ -1154,11 +1162,8 @@ for cn in $(echo "$AK_CODENAMES" | tr ',' ' '); do
         IDX=$((IDX + 1))
     }
 done
-
-while [ $IDX -le 5 ]; do
-    log_raw "device.name$IDX="
-    IDX=$((IDX + 1))
-done
+# (No padding with empty device.nameN= lines — AK3 only checks the names
+# it receives, so emitting blank "device.name2=" ... "device.name5=" is noise.)
 
 log_raw "$SUPPORTED_VERSIONS_LINE"
 [ -n "$SP_YM" ] && [ "$SP_YM" != "N/A" ] && log_raw "supported.patchlevels=$SP_YM"
